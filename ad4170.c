@@ -1,12 +1,15 @@
 // ad4170.c — AD4170-4 SPI driver for Raspberry Pi 5
-// Tested with Linux spidev on RPi5 (kernel 6.x)
+// Translated from known-working ESP32/Arduino code.
 //
-// Build example:
-//   gcc -O2 -Wall -o ad4170_demo ad4170.c ad4170_demo.c
+// Key fixes vs. original attempt:
+//   1. SPI Mode 3 (CPOL=1, CPHA=1), not Mode 0
+//   2. 14-bit addressing: 16-bit command word before each transfer
+//   3. Correct reset: 3x (7x 0xFF + 0xFE) with CS held low throughout
+//   4. setup() sequence matches ESP32 setup_ADC() exactly
+//   5. Voltage conversion: raw * vref / 2^24 (unipolar, 5V ref)
 //
-// Enable SPI on RPi5:
-//   sudo raspi-config  -> Interface Options -> SPI -> Enable
-//   (or add  dtparam=spi=on  to /boot/firmware/config.txt)
+// Build: gcc -O2 -Wall -o ad4170_demo ad4170.c ad4170_demo.c -lm
+// Run:   sudo ./ad4170_demo
 
 #include "ad4170.h"
 
@@ -20,11 +23,11 @@
 #include <linux/spi/spidev.h>
 
 // ============================================================
-//  Internal helpers
+//  Internal helper
 // ============================================================
 
-static int spi_transfer(ad4170_dev_t *dev,
-                        const uint8_t *tx, uint8_t *rx, size_t len)
+static int spi_xfer(ad4170_dev_t *dev,
+                    const uint8_t *tx, uint8_t *rx, size_t len)
 {
     struct spi_ioc_transfer tr = {
         .tx_buf        = (unsigned long)tx,
@@ -35,23 +38,22 @@ static int spi_transfer(ad4170_dev_t *dev,
         .delay_usecs   = 0,
         .cs_change     = 0,
     };
-
     int ret = ioctl(dev->spi_fd, SPI_IOC_MESSAGE(1), &tr);
     if (ret < 0) {
-        perror("spi_transfer: ioctl SPI_IOC_MESSAGE");
+        perror("spi_xfer");
         return -1;
     }
     return 0;
 }
 
 // ============================================================
-//  Public API
+//  Init / close
 // ============================================================
 
 int ad4170_init(ad4170_dev_t *dev, const char *spidev_path, int speed_hz)
 {
     dev->spi_speed_hz  = speed_hz;
-    dev->spi_mode      = SPI_MODE_0;    // CPOL=0, CPHA=0
+    dev->spi_mode      = SPI_MODE_3;    // CPOL=1, CPHA=1
     dev->bits_per_word = 8;
 
     dev->spi_fd = open(spidev_path, O_RDWR);
@@ -65,11 +67,10 @@ int ad4170_init(ad4170_dev_t *dev, const char *spidev_path, int speed_hz)
         ioctl(dev->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &dev->bits_per_word) < 0 ||
         ioctl(dev->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ,  &dev->spi_speed_hz)  < 0)
     {
-        perror("ad4170_init: ioctl configuration");
+        perror("ad4170_init: ioctl config");
         close(dev->spi_fd);
         return -1;
     }
-
     return 0;
 }
 
@@ -81,160 +82,171 @@ void ad4170_close(ad4170_dev_t *dev)
     }
 }
 
-// Write  num_bytes  of  value  to register at  addr.
-// The AD4170 SPI frame: [ADDR byte (R/W=0)] [DATA MSB ... LSB]
-int ad4170_write_reg(ad4170_dev_t *dev, uint8_t addr,
-                     uint32_t value, size_t num_bytes)
+// ============================================================
+//  Low-level register access
+// ============================================================
+
+// Write: [cmd_hi][cmd_lo][data bytes...]  — CS held for entire transaction
+int ad4170_write(ad4170_dev_t *dev, uint16_t cmd,
+                 const uint8_t *data, size_t data_len)
 {
-    if (num_bytes < 1 || num_bytes > 4) return -1;
-
-    uint8_t tx[5] = {0};
-    uint8_t rx[5] = {0};
-
-    tx[0] = addr & 0x3F;                    // write: bit6 = 0
-    for (size_t i = 0; i < num_bytes; i++) {
-        tx[1 + i] = (value >> (8 * (num_bytes - 1 - i))) & 0xFF;
-    }
-
-    return spi_transfer(dev, tx, rx, 1 + num_bytes);
+    size_t total = 2 + data_len;
+    uint8_t tx[total], rx[total];
+    memset(rx, 0, total);
+    tx[0] = (cmd >> 8) & 0xFF;
+    tx[1] =  cmd       & 0xFF;
+    for (size_t i = 0; i < data_len; i++)
+        tx[2 + i] = data[i];
+    return spi_xfer(dev, tx, rx, total);
 }
 
-// Read  num_bytes  from register at  addr  into  *out.
-int ad4170_read_reg(ad4170_dev_t *dev, uint8_t addr,
-                    uint32_t *out, size_t num_bytes)
+// Read: [cmd_hi][cmd_lo][0x00 × data_len] → data bytes in rx[2..]
+int ad4170_read(ad4170_dev_t *dev, uint16_t cmd,
+                uint8_t *data, size_t data_len)
 {
-    if (num_bytes < 1 || num_bytes > 4) return -1;
-
-    uint8_t tx[5] = {0};
-    uint8_t rx[5] = {0};
-
-    tx[0] = (addr & 0x3F) | AD4170_REG_READ;   // read: bit6 = 1
-
-    if (spi_transfer(dev, tx, rx, 1 + num_bytes) < 0)
-        return -1;
-
-    *out = 0;
-    for (size_t i = 0; i < num_bytes; i++) {
-        *out = (*out << 8) | rx[1 + i];
-    }
+    size_t total = 2 + data_len;
+    uint8_t tx[total], rx[total];
+    memset(tx, 0x00, total);
+    memset(rx, 0x00, total);
+    tx[0] = (cmd >> 8) & 0xFF;
+    tx[1] =  cmd       & 0xFF;
+    if (spi_xfer(dev, tx, rx, total) < 0) return -1;
+    for (size_t i = 0; i < data_len; i++)
+        data[i] = rx[2 + i];
     return 0;
 }
 
-// Send 64 SCLKs with DIN high → hardware reset per datasheet §9.4.2
+int ad4170_write16(ad4170_dev_t *dev, uint16_t addr, uint16_t val)
+{
+    uint8_t d[2] = { (val >> 8) & 0xFF, val & 0xFF };
+    return ad4170_write(dev, AD4170_CMD_WRITE(addr), d, 2);
+}
+
+int ad4170_write8(ad4170_dev_t *dev, uint16_t addr, uint8_t val)
+{
+    return ad4170_write(dev, AD4170_CMD_WRITE(addr), &val, 1);
+}
+
+int ad4170_read16(ad4170_dev_t *dev, uint16_t addr, uint16_t *out)
+{
+    uint8_t d[2] = {0};
+    if (ad4170_read(dev, AD4170_CMD_READ(addr), d, 2) < 0) return -1;
+    *out = ((uint16_t)d[0] << 8) | d[1];
+    return 0;
+}
+
+int ad4170_read24(ad4170_dev_t *dev, uint16_t addr, uint32_t *out)
+{
+    uint8_t d[3] = {0};
+    if (ad4170_read(dev, AD4170_CMD_READ(addr), d, 3) < 0) return -1;
+    *out = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
+    return 0;
+}
+
+int ad4170_read8(ad4170_dev_t *dev, uint16_t addr, uint8_t *out)
+{
+    uint8_t d[1] = {0};
+    if (ad4170_read(dev, AD4170_CMD_READ(addr), d, 1) < 0) return -1;
+    *out = d[0];
+    return 0;
+}
+
+// ============================================================
+//  High-level
+// ============================================================
+
+// Reset: CS low → 3x(7x 0xFF + 0xFE) → CS high
+// This is exactly what setup_ADC() does on the ESP32
 int ad4170_reset(ad4170_dev_t *dev)
 {
-    uint8_t tx[8];
-    uint8_t rx[8];
-    memset(tx, 0xFF, sizeof(tx));   // DIN = 1 for 64 clock cycles
-    int ret = spi_transfer(dev, tx, rx, sizeof(tx));
-    usleep(500);                    // Wait for reset to complete (~100 µs)
-    return ret;
-}
-
-// Read Product ID and verify it matches expected value
-int ad4170_check_id(ad4170_dev_t *dev)
-{
-    uint32_t id = 0;
-    if (ad4170_read_reg(dev, AD4170_REG_ID, &id, 2) < 0)
-        return -1;
-
-    printf("AD4170 Product ID: 0x%04X (expected 0x%04X)\n",
-           (unsigned)(id & 0xFFFF), AD4170_PRODUCT_ID);
-
-    return ((id & 0xFFFF) == AD4170_PRODUCT_ID) ? 0 : -1;
-}
-
-// Configure device for single-ended or differential acquisition on channel 0.
-//   ain_pos : positive input pin (0–3 for AIN0–AIN3)
-//   ain_neg : negative input pin, or AD4170_AINM_AVSS for single-ended
-int ad4170_configure_single_channel(ad4170_dev_t *dev,
-                                    uint8_t ain_pos, uint8_t ain_neg)
-{
-    int ret;
-
-    // 1. ADC control: continuous conversion, internal reference enabled
-    uint16_t adc_ctrl = AD4170_ADC_CTRL_MODE_CONTINUOUS
-                      | AD4170_ADC_CTRL_REF_EN
-                      | AD4170_ADC_CTRL_MCLK_SEL_INT;
-    ret = ad4170_write_reg(dev, AD4170_REG_ADC_CTRL, adc_ctrl, 2);
-    if (ret < 0) return ret;
-
-    // 2. Setup 0: PGA gain = 1, internal 2.5 V reference, no chopping
-    uint16_t setup0 = AD4170_SETUP_CHOP_NONE
-                    | AD4170_SETUP_REF_INT
-                    | AD4170_SETUP_GAIN(0);  // gain = 1
-    ret = ad4170_write_reg(dev, AD4170_REG_SETUP0, setup0, 2);
-    if (ret < 0) return ret;
-
-    // 3. Filter 0: Sinc5+Sinc1, ODR code 7 (~2.4 kSPS at 16 MHz MCLK)
-    uint32_t filt0 = AD4170_FILT_SINC5_SINC1 | AD4170_FILT_ODR(7);
-    ret = ad4170_write_reg(dev, AD4170_REG_FILT0, filt0, 3);
-    if (ret < 0) return ret;
-
-    // 4. Channel 0 map: assign setup 0, set AINp/AINm
-    uint16_t ch0_map = AD4170_CH_MAP_SETUP(0)
-                     | AD4170_CH_MAP_AINP(ain_pos)
-                     | AD4170_CH_MAP_AINM(ain_neg);
-    ret = ad4170_write_reg(dev, AD4170_REG_CH0_MAP, ch0_map, 2);
-    if (ret < 0) return ret;
-
-    // 5. Enable channel 0 only
-    ret = ad4170_write_reg(dev, AD4170_REG_CH_EN, 0x0001, 2);
-    if (ret < 0) return ret;
-
-    return 0;
-}
-
-// Poll the STATUS register until a new result is ready, then read DATA.
-// result is sign-extended to int32_t (24-bit two's complement).
-int ad4170_read_data(ad4170_dev_t *dev, int32_t *result)
-{
-    const int max_polls = 10000;
-    uint32_t status;
-
-    // Wait for DATA_READY bit (bit 0 of STATUS = 0 means ready)
-    for (int i = 0; i < max_polls; i++) {
-        if (ad4170_read_reg(dev, AD4170_REG_STATUS, &status, 1) < 0)
-            return -1;
-        if ((status & 0x80) == 0)   // RDY bit (bit 7) goes low when data ready
-            break;
-        if (i == max_polls - 1) {
-            fprintf(stderr, "ad4170_read_data: timeout waiting for RDY\n");
-            return -1;
-        }
-        usleep(10);
+    uint8_t tx[24], rx[24];
+    memset(rx, 0, sizeof(rx));
+    int idx = 0;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 7; j++) tx[idx++] = 0xFF;
+        tx[idx++] = 0xFE;
     }
+    return spi_xfer(dev, tx, rx, sizeof(tx));
+}
 
-    uint32_t raw = 0;
-    if (ad4170_read_reg(dev, AD4170_REG_DATA, &raw, 3) < 0)
-        return -1;
+// Chip type register should read 0x07
+int ad4170_check_chip_type(ad4170_dev_t *dev)
+{
+    uint8_t id = 0;
+    if (ad4170_read8(dev, AD4170_ADDR_CHIP_TYPE, &id) < 0) return -1;
+    printf("Chip type: 0x%02X (expected 0x07)\n", id);
+    return (id == 0x07) ? 0 : -1;
+}
 
-    // Sign-extend 24-bit value to int32_t
-    if (raw & 0x800000)
-        *result = (int32_t)(raw | 0xFF000000);
-    else
-        *result = (int32_t)raw;
+// Mirrors setup_ADC() from the ESP32 code, step for step
+int ad4170_setup(ad4170_dev_t *dev)
+{
+    int r;
+
+    // Switch to 14-bit addressing
+    r = ad4170_write8(dev, AD4170_ADDR_INTERFACE_CFG_B, AD4170_IFCFG_B_14BIT_ADDR);
+    if (r < 0) return r;
+
+    // Soft reset
+    r = ad4170_write8(dev, AD4170_ADDR_INTERFACE_CFG_A, AD4170_IFCFG_A_RESET);
+    if (r < 0) return r;
+
+    // SPI: no CRC, no status append
+    r = ad4170_write8(dev, AD4170_ADDR_SPI_CFG, AD4170_IFCFG_SPI_NO_CRC);
+    if (r < 0) return r;
+
+    // ADC control: continuous read mode
+    r = ad4170_write16(dev, AD4170_ADDR_ADC_CTRL, AD4170_ADC_CTRL_CONT_READ);
+    if (r < 0) return r;
+
+    // Enable channels 0, 1, 2
+    usleep(10000);
+    r = ad4170_write16(dev, AD4170_ADDR_CH_EN, AD4170_CH_EN_0_1_2);
+    if (r < 0) return r;
+
+    // CH_MAP0: AIN0(+), AIN1(-)
+    r = ad4170_write16(dev, AD4170_ADDR_CH0_MAP, AD4170_CH0_MAP_VAL);
+    if (r < 0) return r;
+
+    // CH_MAP1: AIN2(+), AIN3(-)
+    usleep(10000);
+    r = ad4170_write16(dev, AD4170_ADDR_CH1_MAP, AD4170_CH1_MAP_VAL);
+    if (r < 0) return r;
+
+    // CH_MAP2: AIN4(+), AIN5(-)
+    r = ad4170_write16(dev, AD4170_ADDR_CH2_MAP, AD4170_CH2_MAP_VAL);
+    if (r < 0) return r;
+
+    // AFE 0, 1, 2
+    usleep(10000);
+    r = ad4170_write16(dev, AD4170_ADDR_AFE0, AD4170_AFE_VALUE); if (r < 0) return r;
+    r = ad4170_write16(dev, AD4170_ADDR_AFE1, AD4170_AFE_VALUE); if (r < 0) return r;
+    r = ad4170_write16(dev, AD4170_ADDR_AFE2, AD4170_AFE_VALUE); if (r < 0) return r;
+
+    // VBIAS
+    usleep(10000);
+    r = ad4170_write16(dev, AD4170_ADDR_VBIAS, 0x0000);
+    if (r < 0) return r;
 
     return 0;
 }
 
-// Read  count  samples in continuous mode into  buf[].
-int ad4170_read_continuous(ad4170_dev_t *dev, int32_t *buf, size_t count)
+int ad4170_read_channel(ad4170_dev_t *dev, int ch,
+                        uint32_t *raw, float *voltage)
 {
-    for (size_t i = 0; i < count; i++) {
-        if (ad4170_read_data(dev, &buf[i]) < 0)
-            return -1;
-    }
+    static const uint16_t addrs[3] = {
+        AD4170_ADDR_DATA_CH0,
+        AD4170_ADDR_DATA_CH1,
+        AD4170_ADDR_DATA_CH2,
+    };
+    if (ch < 0 || ch > 2) return -1;
+    if (ad4170_read24(dev, addrs[ch], raw) < 0) return -1;
+    if (voltage) *voltage = ad4170_to_voltage(*raw, 5.0f);
     return 0;
 }
 
-// Convert a 24-bit ADC code to volts.
-//   vref    : reference voltage in volts (2.5 for internal)
-//   bipolar : 1 = bipolar (two's complement), 0 = unipolar
-double ad4170_code_to_voltage(int32_t code, double vref, int bipolar)
+// Matches ESP32: voltage = raw * vref / 2^24
+float ad4170_to_voltage(uint32_t raw, float vref)
 {
-    if (bipolar)
-        return ((double)code / 8388608.0) * vref;   // ÷ 2^23
-    else
-        return ((double)(uint32_t)code / 16777216.0) * vref; // ÷ 2^24
+    return ((float)raw * vref) / 16777216.0f;
 }
